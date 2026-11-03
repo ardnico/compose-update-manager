@@ -83,3 +83,86 @@ These are **unit tests only**. No Docker daemon is available in the development 
 ## License
 
 Internal example / adapt to local operational policy.
+
+## v0.1.1: Docker Hub 403 on tag discovery
+
+`hub_tags()` now uses the public Docker Registry HTTP API V2 instead of the
+Docker Hub management API. It obtains a read-only scoped bearer token from
+`auth.docker.io`, then fetches `/v2/<namespace>/<repository>/tags/list`
+from `registry-1.docker.io`, following `Link: ...; rel="next"` pagination.
+It fails closed on incomplete lists, unexpected redirects/pagination hosts,
+or token failures. This remains public Docker Hub only; private registries
+need separate credential handling.
+
+To update an existing installation:
+
+```sh
+sudo cp /opt/svc-update/svc_update.py /opt/svc-update/svc_update.py.bak
+sudo install -m 755 svc_update.py /opt/svc-update/svc_update.py
+sudo python3 /opt/svc-update/svc_update.py --config /etc/svc-update/config.toml check nginx
+```
+
+Before any automatic updates, verify the full upgrade and rollback on an
+isolated test stack. Docker Hub API 403 may also be caused by local proxy
+or network policies, so a registry token request failure should be diagnosed
+with the network team rather than worked around by disabling TLS validation.
+
+## v0.2: bind mount 対応 (2026-11)
+
+**検証状態:** Python 単体テスト通過。実ホストでの Docker 更新・復元・メール通知は未検証。
+事前に `sudo systemctl stop svc-update.timer` で自動更新を止め、独立した試験環境で復元試験を実施すること。
+
+- **読み取り専用 bind (`read_only: true`)**: 受け入れる。更新ツールはバックアップ・復元しない（ホスト側の設定ファイルを変更しない）。設定を別途Git等で管理・退避すること。
+- **読み書き可能 bind (`read_only` 省略または false)**: 関連スタックのコンテナを停止した後、ホスト上のファイル・ディレクトリを tar に保存。更新失敗時、旧イメージ・named volume と一緒に元の内容に復元する。**復元時にはバックアップ取得後に追加・変更されたデータが消える。**
+- **named volume**: 従来通り tar バックアップ・復元する。
+- **既存の他サービスの `build:`**: 許容する（更新対象サービスに `build:` がある場合は引き続き拒否）。再起動は `--no-build`。
+- **安全上の拒否条件**: RW bind の許可ディレクトリ未設定、未存在のソース、パスの途中にシンボリックリンクがある、データ内にシンボリックリンクや特殊ファイルがある、入れ子のbind、RW bindがマウントポイント、バックアップ先との重複、未対応の外部ボリューム等。
+- **重要**: ローカルファイルシステム上のbindだけを想定。外部DB、ネットワーク共有、ホストの独立プロセスがデータを書き込む構成では一貫したバックアップを保証しない。コンテナ以外のライターを止めること。**運用環境での更新成功や無損失復旧は未保証。**
+
+### `config.toml` の変更例
+
+家計簿アプリ (`/opt/docker`) の `app` が `/project/kakeibo-app/data` をRWでbindし、`nginx` が `/mnt/data/nginx/default.conf` をROでbindしている構成の場合：
+
+```toml
+[global]
+backup_root = "/var/backups/svc-update"
+# RW bindソースは必ずこれらの配下（ルートそのものは不可）にあること
+allowed_bind_roots = ["/project/kakeibo-app"]
+
+[services.nginx]
+enabled = true
+auto_update = false
+policy = "patch"
+image = "nginx"
+compose_service = "nginx"  # container_name ではない
+version_variable = "NGINX_VERSION"
+directory = "/opt/docker"
+archive_image = "busybox:1.36.1"
+health_url = "http://127.0.0.1:8080/"
+health_timeout_seconds = 90
+```
+
+※実際の `[email]` セクションと設定値は既存のものを保持すること。`allowed_bind_roots` は `[global]` セクション内へ配置する。`/project/kakeibo-app/data` を直接指定しても許容されない（許可ルート**直下の子孫**のみ許可する設計）。
+
+**注意:** Nginx のパッチ更新であっても、本ツールはComposeプロジェクト全体を停止し、RW bindの家計簿データも取得・復元対象にする。このため家計簿にダウンタイムが生じる。起動前に独立したバックアップを取ること。
+
+### 動作確認
+
+```bash
+sudo systemctl stop svc-update.timer
+sudo install -m 0755 svc_update.py /opt/svc-update/svc_update.py
+sudo python3 -m unittest discover -s tests -v
+sudo python3 /opt/svc-update/svc_update.py --config /etc/svc-update/config.toml check nginx
+sudo python3 /opt/svc-update/svc_update.py --config /etc/svc-update/config.toml upgrade nginx  # DRY RUN: バックアップ検証は行わない
+# 破壊的変更を伴う可能性がある。別環境で復元試験後にのみ実行:
+# sudo python3 /opt/svc-update/svc_update.py --config /etc/svc-update/config.toml upgrade nginx --apply
+```
+
+### ロールバック時の取り扱い
+
+- 失敗時にはComposeスタック全体を停止してからRW bindを復元する。
+- bindバックアップは `backup_root/<service>/<timestamp>/bind-XX.tar`、対応先は `manifest.json` に記録される。
+- 復元処理は同一親ディレクトリのステージング先へ展開し、元のパスを退避してから差し替える。差し替えが失敗した場合は元のパスを戻す。ただし複数の復元対象を跨いだ完全な原子的ロールバックではない。
+- 自動復元に失敗した場合は `inflight.json` が残り、以後の自動更新を停止する。人手でバックアップと整合性を確認する。
+- RO bind は復元しない。外部で設定を変更した場合、旧バージョンで動作しない可能性がある。
+- バックアップ先はアプリのデータ領域・Docker volume外の独立ストレージとし、十分な容量とアクセス制限を確保する。

@@ -2,12 +2,39 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import io
+import json
 
 spec = importlib.util.spec_from_file_location('svc_update', Path(__file__).parents[1] / 'svc_update.py')
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 class TestUpdater(unittest.TestCase):
+    def test_hub_tags_registry_pagination(self):
+        class Response:
+            def __init__(self, data, link=''):
+                self.data = json.dumps(data).encode()
+                self.headers = {'Link': link}
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def read(self, *_):
+                return self.data
+        calls = []
+        def fake_open(request, timeout=0):
+            calls.append(request.full_url)
+            if 'auth.docker.io' in request.full_url:
+                return Response({'token': 'test-token'})
+            self.assertEqual(request.get_header('Authorization'), 'Bearer test-token')
+            if 'last=' not in request.full_url:
+                return Response({'tags': ['1.28.0']}, '</v2/library/nginx/tags/list?n=1000&last=1.28.0>; rel="next"')
+            return Response({'tags': ['1.28.1']})
+        with patch.object(mod.urllib.request, 'urlopen', side_effect=fake_open):
+            self.assertEqual(mod.hub_tags('nginx'), ['1.28.0', '1.28.1'])
+        self.assertEqual(len(calls), 3)
+
     def test_next_patch(self):
         tags = ['1.28.4', '1.28.2', '1.29.0', '1.28.1-alpine', 'latest', '1.28.0']
         self.assertEqual(mod.next_patch('1.28.0', tags), '1.28.2')

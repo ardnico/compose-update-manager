@@ -2,6 +2,8 @@
 """Conservative Docker Compose application patch updater (Python 3.11+)."""
 import argparse
 import datetime as dt
+import stat
+import uuid
 import fcntl
 import hashlib
 import json
@@ -84,6 +86,12 @@ def load_config(path):
     root = Path(conf['global']['backup_root']).resolve()
     root.mkdir(parents=True, exist_ok=True)
     conf['_backup_root'] = root
+    allowlist = conf['global'].get('allowed_bind_roots', [])
+    if not isinstance(allowlist, list) or any(not isinstance(v, str) or not Path(v).is_absolute() or not Path(v).is_dir() for v in allowlist):
+        raise UpdateError('global.allowed_bind_roots must list existing absolute directories')
+    for v in allowlist:
+        if Path(v).resolve() == Path('/') or any(p.is_symlink() for p in (Path(v), *Path(v).parents)):
+            raise UpdateError(f'Unsafe allowed_bind_roots entry: {v}')
     services = conf.get('services', {})
     if not services:
         raise UpdateError('No [services.*] configured')
@@ -123,8 +131,11 @@ def current_version(svc):
         raise UpdateError(f'{svc["_name"]}: version must be an exact X.Y.Z tag, got {v!r}')
     return v
 
-def hub_tags(image, max_pages=10):
-    # Public Docker Hub only. No automated auth/private registries in this MVP.
+def hub_tags(image, max_pages=100):
+    """List tags using Docker Registry HTTP API V2 (public Docker Hub images).
+
+    Reject incomplete pagination rather than silently missing a patch version.
+    """
     fields = image.split('/')
     if len(fields) == 1:
         ns, repo = 'library', fields[0]
@@ -132,21 +143,54 @@ def hub_tags(image, max_pages=10):
         ns, repo = fields
     else:
         raise UpdateError('Only Docker Hub namespace/repository images are supported')
-    url = 'https://hub.docker.com/v2/repositories/' + urllib.parse.quote(ns) + '/' + urllib.parse.quote(repo) + '/tags?page_size=100'
-    names = []
-    for _ in range(max_pages):
-        req = urllib.request.Request(url, headers={'User-Agent': 'compose-update-manager/0.1'})
+    if not SAFE_NAME.fullmatch(ns) or not SAFE_NAME.fullmatch(repo):
+        raise UpdateError('Invalid Docker Hub repository name')
+
+    repository = f'{ns}/{repo}'
+    auth_query = urllib.parse.urlencode({
+        'service': 'registry.docker.io',
+        'scope': f'repository:{repository}:pull',
+    })
+    auth_url = 'https://auth.docker.io/token?' + auth_query
+    headers = {'User-Agent': 'compose-update-manager/0.1.1', 'Accept': 'application/json'}
+    try:
+        req = urllib.request.Request(auth_url, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as res:
-            obj = json.load(res)
-        names.extend(tag['name'] for tag in obj.get('results', []) if 'name' in tag)
-        url = obj.get('next')
-        if not url:
-            break
-        if not url.startswith('https://hub.docker.com/'):
-            raise UpdateError('Unexpected pagination URL')
-    else:
-        raise UpdateError('Registry tag listing is incomplete (page limit)')
-    return names
+            token = json.load(res).get('token')
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        raise UpdateError(f'Docker Registry token request failed: {e}') from e
+    if not token:
+        raise UpdateError('Docker Registry token response did not include token')
+
+    url = f'https://registry-1.docker.io/v2/{repository}/tags/list?n=1000'
+    names = []
+    visited = set()
+    for _ in range(max_pages):
+        if url in visited:
+            raise UpdateError('Registry pagination loop detected')
+        visited.add(url)
+        req = urllib.request.Request(url, headers={
+            **headers, 'Authorization': f'Bearer {token}',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                obj = json.load(res)
+                link = res.headers.get('Link', '')
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            raise UpdateError(f'Docker Registry tag listing failed: {e}') from e
+        names.extend(obj.get('tags') or [])
+        # Distribution API pagination uses the RFC 5988 Link header.
+        match = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link, re.I)
+        if not match:
+            return names
+        next_url = urllib.parse.urljoin(url, match.group(1))
+        parsed = urllib.parse.urlparse(next_url)
+        if (parsed.scheme, parsed.hostname, parsed.port) != ('https', 'registry-1.docker.io', None):
+            raise UpdateError('Unexpected registry pagination URL')
+        if parsed.path != f'/v2/{repository}/tags/list':
+            raise UpdateError('Unexpected registry pagination path')
+        url = next_url
+    raise UpdateError('Registry tag listing is incomplete (page limit)')
 
 def next_patch(current, tags):
     base = tuple(map(int, current.split('.')))
@@ -164,39 +208,110 @@ def sha256(path):
             h.update(block)
     return h.hexdigest()
 
-def inspect_stack(svc, config):
+def under(path, root):
+    """Whether path is root or a descendant of root (resolved paths)."""
+    return path == root or root in path.parents
+
+
+def ensure_plain_tree(source):
+    """Refuse symlinks/special files; bind data must be a normal tree."""
+    if source.is_symlink():
+        raise UpdateError(f'Symlink bind source not supported: {source}')
+    mode = source.lstat().st_mode
+    if stat.S_ISREG(mode):
+        return 'file'
+    if not stat.S_ISDIR(mode):
+        raise UpdateError(f'Special bind source not supported: {source}')
+    for dirpath, dirs, files in os.walk(source, followlinks=False):
+        for name in dirs + files:
+            entry = Path(dirpath) / name
+            st = entry.lstat().st_mode
+            if not (stat.S_ISREG(st) or stat.S_ISDIR(st)):
+                raise UpdateError(f'Symlink/special file in bind source: {entry}')
+    return 'directory'
+
+
+def check_bind_source(source, backup_root, allowed_roots, writable):
+    """Validated canonical host path, guarded against destructive restore."""
+    if not source or not Path(source).is_absolute():
+        raise UpdateError(f'Bind source must be an absolute existing path: {source!r}')
+    raw = Path(source)
+    if not raw.exists():
+        raise UpdateError(f'Bind source does not exist: {source}')
+    if any(p.is_symlink() for p in (raw, *raw.parents)):
+        raise UpdateError(f'Symlink bind path component unsupported: {source}')
+    resolved = raw.resolve(strict=True)
+    if resolved == Path('/') or under(backup_root, resolved) or under(resolved, backup_root):
+        raise UpdateError(f'Unsafe bind/backup overlap: {resolved}')
+    if writable:
+        if not allowed_roots:
+            raise UpdateError('RW bind mount requires global.allowed_bind_roots allowlist')
+        if not any(under(resolved, root) and resolved != root for root in allowed_roots):
+            raise UpdateError(f'RW bind source is outside allowed_bind_roots: {resolved}')
+        if os.path.ismount(resolved):
+            raise UpdateError(f'RW bind source is a mount point: {resolved}')
+    return resolved
+
+
+def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
     target = svc['compose_service']
     services = config['services']
     if target not in services:
         raise UpdateError(f'Target {target} missing in compose config')
     if services[target].get('build'):
-        raise UpdateError('build: is not supported')
+        raise UpdateError('Target service with build: is not supported')
     if services[target].get('image') != f'{svc["image"]}:{current_version(svc)}':
         raise UpdateError('Target image does not match image:version in config')
     volumes = config.get('volumes', {})
     for key, value in volumes.items():
         if value.get('external'):
             raise UpdateError(f'External volume {key} is unsupported')
-    mounted = set()
+    named = set()
+    binds = {}
+    backup_root = backup_root or Path('/var/backups/svc-update').resolve()
+    allowed_roots = [Path(root).resolve(strict=True) for root in allowed_roots]
     for service_name, service in services.items():
-        if service.get('build'):
-            raise UpdateError(f'Build service {service_name} is unsupported')
+        # Non-target services may have build:; --no-build prevents building them.
         for mount in service.get('volumes', []):
-            if not isinstance(mount, dict) or mount.get('type') != 'volume':
-                raise UpdateError(f'Bind/anonymous mount on {service_name}: not safely backed up by MVP')
+            if not isinstance(mount, dict):
+                raise UpdateError(f'Unsupported volume specification on {service_name}')
             source = mount.get('source')
-            if not source or source not in volumes:
-                raise UpdateError(f'Undeclared/anonymous volume on {service_name}')
-            mounted.add(source)
-    if not mounted:
-        raise UpdateError('Stack has no named volumes; refuse to update with no data backup')
-    names = sorted(volumes[key].get('name', key) for key in mounted)
+            kind = mount.get('type')
+            if kind == 'volume':
+                if not source or source not in volumes:
+                    raise UpdateError(f'Undeclared/anonymous volume on {service_name}')
+                named.add(source)
+            elif kind == 'bind':
+                writable = not mount.get('read_only', False)
+                resolved = check_bind_source(source, backup_root, allowed_roots, writable)
+                key = str(resolved)
+                existing = binds.get(key)
+                if existing:
+                    existing['writable'] = existing['writable'] or writable
+                else:
+                    binds[key] = {'source': key, 'writable': writable}
+            else:
+                raise UpdateError(f'Unsupported mount type {kind!r} on {service_name}')
+    # Never write over overlapping directories during a rollback.
+    sources = [Path(x) for x in binds]
+    for i, one in enumerate(sources):
+        for two in sources[i + 1:]:
+            if under(one, two) or under(two, one):
+                raise UpdateError(f'Nested bind mounts unsupported: {one} / {two}')
+    # Re-check consolidated access mode (one bind may be shared RO/RW).
+    for row in binds.values():
+        if row['writable']:
+            check_bind_source(row['source'], backup_root, allowed_roots, True)
+        row['kind'] = ensure_plain_tree(Path(row['source']))
+    names = sorted(volumes[key].get('name', key) for key in named)
     for name in names:
         if not SAFE_NAME.fullmatch(name):
             raise UpdateError(f'Invalid volume name: {name}')
         data = json.loads(cmd(['docker', 'volume', 'inspect', name]))[0]
         if data.get('Driver') != 'local' or data.get('Options'):
             raise UpdateError(f'Only simple local volumes are supported: {name}')
+    if not names and not binds:
+        raise UpdateError('Stack has no persisted mounts to back up')
     for service_name in services:
         cid = compose(svc, 'ps', '-q', service_name)
         if not cid:
@@ -204,7 +319,7 @@ def inspect_stack(svc, config):
         state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
         if not state['Running']:
             raise UpdateError(f'{service_name}: not running')
-    return names
+    return {'volumes': names, 'binds': sorted(binds.values(), key=lambda r: r['source'])}
 
 def verify_candidate(svc, candidate, config):
     if not VERSION.fullmatch(candidate):
@@ -235,12 +350,33 @@ def verify_candidate(svc, candidate, config):
     finally:
         file.unlink(missing_ok=True)
 
-def backup(svc, root, names, old, old_image_id):
+def archive_bind(source, destination):
+    """Archive a host file/directory under payload/, including metadata."""
+    ensure_plain_tree(source)
+    with tarfile.open(destination, 'w') as tar:
+        tar.add(source, arcname='payload', recursive=True)
+    # Files can change mid-archive; all stack containers must be stopped first.
+
+
+def verify_bind_archive(archive):
+    with tarfile.open(archive, 'r') as tar:
+        members = tar.getmembers()
+        if not members or members[0].name != 'payload':
+            raise UpdateError(f'Malformed bind archive: {archive}')
+        for member in members:
+            member_path = Path(member.name)
+            if (member_path.is_absolute() or '..' in member_path.parts
+                    or member_path.parts[0] != 'payload'
+                    or not (member.isfile() or member.isdir())):
+                raise UpdateError(f'Unsafe bind archive member: {member.name}')
+
+
+def backup(svc, root, mounts, old, old_image_id):
     path = root / svc['_name'] / now()
     path.mkdir(parents=True, exist_ok=False, mode=0o700)
     shutil.copy2(svc['_dir'] / 'versions.env', path / 'versions.env')
     records = []
-    for index, volume in enumerate(names):
+    for index, volume in enumerate(mounts['volumes']):
         archive = f'volume-{index:02d}.tar'
         cmd(['docker', 'run', '--rm', '--network', 'none', '--mount', f'type=volume,source={volume},target=/source,readonly',
              '--mount', f'type=bind,source={path},target=/backup', svc.get('archive_image', 'busybox:1.36.1'),
@@ -249,13 +385,58 @@ def backup(svc, root, names, old, old_image_id):
             if t.getmembers() is None:
                 raise UpdateError('Unreadable archive')
         records.append({'volume': volume, 'archive': archive, 'sha256': sha256(path / archive)})
-    manifest = {'service': svc['_name'], 'created_at': now(), 'old_version': old,
-                'old_image_id': old_image_id, 'volumes': records,
+    bind_records = []
+    for index, mount in enumerate(mounts['binds']):
+        if not mount['writable']:
+            continue  # Read-only bind paths are NOT modified by the updater.
+        source = Path(mount['source'])
+        kind = ensure_plain_tree(source)
+        if kind != mount['kind']:
+            raise UpdateError(f'Bind source type changed: {source}')
+        archive = f'bind-{index:02d}.tar'
+        archive_bind(source, path / archive)
+        verify_bind_archive(path / archive)
+        bind_records.append({'source': str(source), 'kind': kind,
+                             'archive': archive, 'sha256': sha256(path / archive)})
+    manifest = {'format': 2, 'service': svc['_name'], 'created_at': now(), 'old_version': old,
+                'old_image_id': old_image_id, 'volumes': records, 'binds': bind_records,
                 'versions_sha256': sha256(path / 'versions.env')}
     atom_write(path / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
     return path
 
-def restore(svc, path, with_versions=True):
+
+def replace_bind_from_archive(archive, source, expected_kind):
+    """Extract to sibling staging and replace original with rollback-on-error."""
+    actual_kind = ensure_plain_tree(source)
+    if actual_kind != expected_kind or os.path.ismount(source):
+        raise UpdateError(f'Bind source changed type or mount status: {source}')
+    token = uuid.uuid4().hex
+    staging = source.parent / f'.svc-update-stage-{token}'
+    previous = source.parent / f'.svc-update-previous-{token}'
+    try:
+        staging.mkdir(mode=0o700)
+        with tarfile.open(archive, 'r') as tar:
+            tar.extractall(path=staging, filter='data')
+        payload = staging / 'payload'
+        if ensure_plain_tree(payload) != expected_kind:
+            raise UpdateError(f'Bind archive source type mismatch: {source}')
+        os.rename(source, previous)
+        try:
+            os.rename(payload, source)
+        except Exception:
+            os.rename(previous, source)
+            raise
+        # Removing the old data is only safe after the new path is committed.
+        if expected_kind == 'directory':
+            shutil.rmtree(previous)
+        else:
+            previous.unlink()
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
+def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
     path = path.resolve()
     manifest_path = path / 'manifest.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
@@ -270,15 +451,25 @@ def restore(svc, path, with_versions=True):
             for member in t.getmembers():
                 if member.name.startswith('/') or '..' in Path(member.name).parts:
                     raise UpdateError('Unsafe archive path')
+    # Validate ALL bind archives and destinations before changing versions or stopping containers.
+    for row in manifest.get('binds', []):
+        archive = path / row['archive']
+        if sha256(archive) != row['sha256']:
+            raise UpdateError('Backup bind checksum mismatch')
+        verify_bind_archive(archive)
+        check_bind_source(row['source'], backup_root or path.parent.parent, allowed_roots, True)
+        if ensure_plain_tree(Path(row['source'])) != row['kind']:
+            raise UpdateError(f'Bind source type changed: {row["source"]}')
     if with_versions:
         atom_write(svc['_dir'] / 'versions.env', (path / 'versions.env').read_text(encoding='utf-8'))
-    # Explicitly recreate containers on the old configuration; NEVER remove volumes.
+    # Ensure existing containers release bind mounts and volumes before restoring.
     compose(svc, 'down', '--remove-orphans', timeout=300)
     for row in manifest['volumes']:
         cmd(['docker', 'run', '--rm', '--network', 'none', '--mount', f'type=volume,source={row["volume"]},target=/target',
              '--mount', f'type=bind,source={path},target=/backup,readonly', svc.get('archive_image', 'busybox:1.36.1'),
              'sh', '-c', f'cd /target && rm -rf -- ./* ./.[!.]* ./..?* && tar -xpf /backup/{row["archive"]}'], timeout=3600)
-    # Validate old image has not been replaced locally.
+    for row in manifest.get('binds', []):
+        replace_bind_from_archive(path / row['archive'], Path(row['source']), row['kind'])
     current_id = cmd(['docker', 'image', 'inspect', '-f', '{{.Id}}', f'{svc["image"]}:{manifest["old_version"]}'])
     if current_id != manifest['old_image_id']:
         raise UpdateError('Old image identity changed; manual recovery required')
@@ -362,7 +553,7 @@ def do_upgrade(conf, svc, candidate, apply=False):
     if journal.exists():
         raise UpdateError(f'Existing interrupted transaction: {journal}. Manual review required')
     config = compose_config(svc)
-    names = inspect_stack(svc, config)
+    mounts = inspect_stack(svc, config, root, conf['global'].get('allowed_bind_roots', []))
     verify_candidate(svc, candidate, config)
     # All network/pull work happens before any outage.
     cmd(['docker', 'pull', f'{svc["image"]}:{candidate}'], timeout=1200)
@@ -374,7 +565,7 @@ def do_upgrade(conf, svc, candidate, apply=False):
         make_journal(root, svc, 'stopping', old=old, new=candidate)
         compose(svc, 'stop', timeout=360)
         make_journal(root, svc, 'backing_up', old=old, new=candidate)
-        backup_dir = backup(svc, root, names, old, previous_id)
+        backup_dir = backup(svc, root, mounts, old, previous_id)
         make_journal(root, svc, 'deploying', old=old, new=candidate, backup=str(backup_dir))
         replace_env(svc['_dir'] / 'versions.env', svc['version_variable'], candidate)
         changed = True
@@ -388,7 +579,7 @@ def do_upgrade(conf, svc, candidate, apply=False):
         if backup_dir and changed:
             try:
                 make_journal(root, svc, 'rolling_back', old=old, new=candidate, backup=str(backup_dir), failure=failure)
-                restore(svc, backup_dir)
+                restore(svc, backup_dir, allowed_roots=conf['global'].get('allowed_bind_roots', []), backup_root=root)
                 emit(conf, f'ROLLED BACK {svc["_name"]}', f'Update failed: {failure}\nRestore verified. Backup: {backup_dir}')
                 journal.unlink(missing_ok=True)
             except Exception as restore_exc:
@@ -439,7 +630,7 @@ def main():
             if not args.apply:
                 print('DRY RUN: restore would overwrite current data:', path)
                 return
-            restore(svc, path)
+            restore(svc, path, allowed_roots=conf['global'].get('allowed_bind_roots', []), backup_root=conf['_backup_root'])
             (conf['_backup_root'] / svc['_name'] / 'inflight.json').unlink(missing_ok=True)
             emit(conf, f'MANUAL RESTORE VERIFIED {svc["_name"]}', f'Backup: {path}')
             return

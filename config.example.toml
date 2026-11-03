@@ -1,6 +1,8 @@
 [global]
 # Backup directory must NOT reside inside any managed Docker volume.
 backup_root = "/var/backups/svc-update"
+# Required for stacks with writable bind mounts; choose narrow existing parent directories.
+# allowed_bind_roots = ["/project/kakeibo-app"]
 
 [email]
 enabled = false
