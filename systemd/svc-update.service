@@ -1,0 +1,17 @@
+[Unit]
+Description=Safe Docker Compose patch update manager
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/svc-update/svc_update.py --config /etc/svc-update/config.toml run --apply
+TimeoutStartSec=3h
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# Requires access to Docker socket and managed services, so this is root-equivalent.

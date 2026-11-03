@@ -1,0 +1,11 @@
+name: svc-nginx-lab
+services:
+  web:
+    image: nginx:${NGINX_VERSION:?Set version in versions.env}
+    ports:
+      - "127.0.0.1:${NGINX_PORT:-18080}:80"
+    restart: unless-stopped
+    volumes:
+      - nginx_cache:/var/cache/nginx
+volumes:
+  nginx_cache:

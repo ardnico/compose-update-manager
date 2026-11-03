@@ -1,0 +1,37 @@
+[global]
+# Backup directory must NOT reside inside any managed Docker volume.
+backup_root = "/var/backups/svc-update"
+
+[email]
+enabled = false
+host = "smtp.internal.example"
+port = 25
+starttls = false
+from = "svc-update@example.invalid"
+to = ["ops@example.invalid"]
+
+[services.nginx]
+enabled = true
+auto_update = false         # Turn on after successful restore drills
+policy = "patch"           # Only X.Y.Z -> X.Y.(Z+N), same major.minor
+image = "nginx"             # Docker Hub only in this version
+compose_service = "web"
+version_variable = "NGINX_VERSION"
+directory = "/srv/containers/nginx"
+archive_image = "busybox:1.36.1"
+health_url = "http://127.0.0.1:18080/"
+health_timeout_seconds = 90
+
+# Enable after placing a compatible MediaWiki stack in this directory,
+# and after verifying the DB migration & restore procedures.
+[services.mediawiki]
+enabled = false
+auto_update = false
+policy = "patch"
+image = "mediawiki"
+compose_service = "mediawiki"
+version_variable = "MEDIAWIKI_VERSION"
+directory = "/srv/containers/mediawiki"
+archive_image = "busybox:1.36.1"
+health_url = "http://127.0.0.1:18081/"
+health_timeout_seconds = 180

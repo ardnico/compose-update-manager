@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Docker Compose patch update check
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=false
+RandomizedDelaySec=10m
+Unit=svc-update.service
+
+[Install]
+WantedBy=timers.target
