@@ -77,9 +77,10 @@ class TestBinds(unittest.TestCase):
                  patch.object(mod, 'cmd', return_value=json.dumps([{'State': {'Running': True}}])):
                 result = mod.inspect_stack(svc, config, root / 'backup', [root / 'project'])
             self.assertEqual(result['volumes'], [])
-            self.assertEqual(len(result['binds']), 2)
-            self.assertTrue(next(x for x in result['binds'] if x['source'] == str(app_data))['writable'])
-            self.assertFalse(next(x for x in result['binds'] if x['source'] == str(nginx_conf))['writable'])
+            # Only nginx is stopped; app's writable data must NOT be backed up or restored.
+            self.assertEqual(len(result['binds']), 1)
+            self.assertFalse(result['binds'][0]['writable'])
+            self.assertEqual(result['binds'][0]['source'], str(nginx_conf))
 
 
 if __name__ == '__main__':
