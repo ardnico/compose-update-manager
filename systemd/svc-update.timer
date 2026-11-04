@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly Docker Compose patch update check
+Description=Nightly Docker Compose image update check
 
 [Timer]
 OnCalendar=*-*-* 02:00:00
