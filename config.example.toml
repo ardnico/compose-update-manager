@@ -1,8 +1,7 @@
 [global]
-# Backup directory must NOT reside inside any managed Docker volume.
 backup_root = "/var/backups/svc-update"
-# Required for stacks with writable bind mounts; choose narrow existing parent directories.
-# allowed_bind_roots = ["/project/kakeibo-app"]
+# Required only when the TARGET service mounts writable host directories:
+# allowed_bind_roots = ["/project/myapp"]
 
 [email]
 enabled = false
@@ -13,27 +12,18 @@ from = "svc-update@example.invalid"
 to = ["ops@example.invalid"]
 
 [services.nginx]
-enabled = true
-auto_update = false         # Turn on after successful restore drills
-policy = "patch"           # Only X.Y.Z -> X.Y.(Z+N), same major.minor
-image = "nginx"             # Docker Hub only in this version
-compose_service = "web"
-version_variable = "NGINX_VERSION"
+enabled = false
+auto_update = false
+policy = "patch"  # patch, minor, major, any, latest
+image = "nginx"   # Public Docker Hub images only
+compose_service = "web" # The services: KEY, not container_name
 directory = "/srv/containers/nginx"
+# Autodetect standard Compose file names, or select explicitly:
+# compose_file = "docker-compose.yml"
+# compose_files = ["compose.yaml", "compose.override.yaml"]
+version_variable = "NGINX_VERSION"
 archive_image = "busybox:1.36.1"
 health_url = "http://127.0.0.1:18080/"
 health_timeout_seconds = 90
-
-# Enable after placing a compatible MediaWiki stack in this directory,
-# and after verifying the DB migration & restore procedures.
-[services.mediawiki]
-enabled = false
-auto_update = false
-policy = "patch"
-image = "mediawiki"
-compose_service = "mediawiki"
-version_variable = "MEDIAWIKI_VERSION"
-directory = "/srv/containers/mediawiki"
-archive_image = "busybox:1.36.1"
-health_url = "http://127.0.0.1:18081/"
-health_timeout_seconds = 180
+# To allow automated major/latest updates (high risk):
+# allow_breaking_auto_update = true
