@@ -1,5 +1,5 @@
 [Unit]
-Description=Safe Docker Compose patch update manager
+Description=Safe Docker Compose image update manager
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
