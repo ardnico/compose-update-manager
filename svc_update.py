@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conservative Docker Compose application patch updater (Python 3.11+)."""
+"""Conservative Docker Compose image updater (Python 3.11+)."""
 import argparse
 import datetime as dt
 import stat
@@ -22,7 +22,9 @@ import urllib.parse
 import urllib.request
 from email.message import EmailMessage
 
-VERSION = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')
+VERSION = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([a-z0-9][a-z0-9._-]*))?$')
+POLICIES = {'patch', 'minor', 'major', 'any', 'latest'}
+COMPOSE_NAMES = ('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')
 VARIABLE = re.compile(r'^[A-Z][A-Z0-9_]*$')
 SAFE_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
 
@@ -80,6 +82,35 @@ def replace_env(path, key, value):
         raise UpdateError(f'Expected one {key} entry in {path}; found {count}')
     atom_write(path, '\n'.join(lines) + '\n')
 
+def parse_version(tag):
+    """(major, minor, patch), exact flavor. Qualifiers are immutable flavors, not SemVer pre-releases."""
+    match = VERSION.fullmatch(tag)
+    if not match:
+        raise UpdateError(f'Unsupported image tag {tag!r}; expected X.Y.Z or X.Y.Z-<flavor>')
+    return tuple(map(int, match.group(1, 2, 3))), match.group(4) or ''
+
+
+def select_compose_files(directory, svc):
+    """Resolve explicit -f files or one standard Compose filename (never merge implicitly)."""
+    selected = svc.get('compose_files')
+    if selected is None:
+        selected = [svc['compose_file']] if 'compose_file' in svc else [n for n in COMPOSE_NAMES if (directory / n).is_file()][:1]
+    if not isinstance(selected, list) or not selected or any(not isinstance(item, str) for item in selected):
+        raise UpdateError('Set compose_file or a nonempty compose_files list')
+    if len(set(selected)) != len(selected):
+        raise UpdateError('Duplicate Compose file configured')
+    paths = []
+    for relative in selected:
+        rel = Path(relative)
+        if rel.is_absolute() or '..' in rel.parts or not relative.endswith(('.yml', '.yaml')):
+            raise UpdateError(f'Unsafe Compose path: {relative}')
+        file = directory / rel
+        if not file.is_file() or not file.resolve().is_relative_to(directory):
+            raise UpdateError(f'Compose file not found under {directory}: {relative}')
+        paths.append(file)
+    return paths
+
+
 def load_config(path):
     with path.open('rb') as fh:
         conf = tomllib.load(fh)
@@ -100,13 +131,19 @@ def load_config(path):
             raise UpdateError('Invalid service name')
         svc['_name'] = name
         svc['_dir'] = Path(svc['directory']).resolve()
-        if not svc['_dir'].is_dir() and svc.get("enabled", False):
+        if not svc.get('enabled', False):
+            continue
+        if not svc['_dir'].is_dir():
             raise UpdateError(f'No directory: {svc["_dir"]}')
-        for part in ('compose.yaml', '.env', 'versions.env'):
-            if svc.get("enabled", False) and not (svc['_dir'] / part).is_file():
+        for part in ('.env', 'versions.env'):
+            if not (svc['_dir'] / part).is_file():
                 raise UpdateError(f'Missing {part} for {name}')
-        if svc.get('policy', 'patch') != 'patch':
-            raise UpdateError('MVP only supports patch policy')
+        svc['_compose_files'] = select_compose_files(svc['_dir'], svc)
+        policy = svc.get('policy', 'patch')
+        if policy not in POLICIES:
+            raise UpdateError(f'Invalid policy {policy!r}; expected one of {sorted(POLICIES)}')
+        if policy in {'major', 'latest'} and svc.get('auto_update', False) and not svc.get('allow_breaking_auto_update', False):
+            raise UpdateError(f'{name}: {policy} auto_update requires allow_breaking_auto_update = true')
         if not VARIABLE.fullmatch(svc['version_variable']):
             raise UpdateError('Invalid version variable')
         if not re.fullmatch(r'[a-z0-9][a-z0-9._/-]*', svc['image']):
@@ -115,21 +152,26 @@ def load_config(path):
             raise UpdateError('Invalid compose_service')
     return conf
 
+
 def compose(svc, *args, version_file=None, timeout=240):
     directory = svc['_dir']
     version_file = version_file or directory / 'versions.env'
-    keys = set(parse_env(directory / ".env")) | set(parse_env(version_file))
-    return cmd(['docker', 'compose', '--project-directory', str(directory), '-f', str(directory / 'compose.yaml'),
-                '--env-file', str(directory / '.env'), '--env-file', str(version_file), *args], cwd=directory, timeout=timeout, clean_keys=keys)
+    keys = set(parse_env(directory / '.env')) | set(parse_env(version_file))
+    files = svc.get('_compose_files') or select_compose_files(directory, svc)
+    flags = [arg for file in files for arg in ('-f', str(file))]
+    return cmd(['docker', 'compose', '--project-directory', str(directory), *flags,
+                '--env-file', str(directory / '.env'), '--env-file', str(version_file), *args],
+               cwd=directory, timeout=timeout, clean_keys=keys)
+
 
 def compose_config(svc, version_file=None):
     return json.loads(compose(svc, 'config', '--format', 'json', version_file=version_file))
 
+
 def current_version(svc):
-    v = parse_env(svc['_dir'] / 'versions.env').get(svc['version_variable'], '')
-    if not VERSION.fullmatch(v):
-        raise UpdateError(f'{svc["_name"]}: version must be an exact X.Y.Z tag, got {v!r}')
-    return v
+    version = parse_env(svc['_dir'] / 'versions.env').get(svc['version_variable'], '')
+    parse_version(version)
+    return version
 
 def hub_tags(image, max_pages=100):
     """List tags using Docker Registry HTTP API V2 (public Docker Hub images).
@@ -152,7 +194,7 @@ def hub_tags(image, max_pages=100):
         'scope': f'repository:{repository}:pull',
     })
     auth_url = 'https://auth.docker.io/token?' + auth_query
-    headers = {'User-Agent': 'compose-update-manager/0.1.1', 'Accept': 'application/json'}
+    headers = {'User-Agent': 'compose-update-manager/0.3', 'Accept': 'application/json'}
     try:
         req = urllib.request.Request(auth_url, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as res:
@@ -192,14 +234,45 @@ def hub_tags(image, max_pages=100):
         url = next_url
     raise UpdateError('Registry tag listing is incomplete (page limit)')
 
+def next_version(current, tags, policy='patch'):
+    """Select version strictly within the same flavor. Never silently switch image variants."""
+    if policy not in POLICIES:
+        raise UpdateError(f'Unsupported update policy: {policy}')
+    base, flavor = parse_version(current)
+    eligible = []
+    for tag in tags:
+        try:
+            version, candidate_flavor = parse_version(tag)
+        except (UpdateError, TypeError):
+            continue
+        if candidate_flavor != flavor or version <= base:
+            continue
+        if policy == 'patch' and version[:2] != base[:2]:
+            continue
+        if policy == 'minor' and (version[0] != base[0] or version[1] <= base[1]):
+            continue
+        if policy == 'major' and version[0] <= base[0]:
+            continue
+        eligible.append((version, tag))
+    if not eligible:
+        return None
+    if policy == 'minor':
+        closest_minor = min(row[0][1] for row in eligible)
+        eligible = [row for row in eligible if row[0][1] == closest_minor]
+    if policy == 'major':
+        closest_major = min(row[0][0] for row in eligible)
+        eligible = [row for row in eligible if row[0][0] == closest_major]
+    selector = max if policy == 'latest' else min
+    return selector(eligible, key=lambda row: row[0])[1]
+
+
 def next_patch(current, tags):
-    base = tuple(map(int, current.split('.')))
-    options = sorted((tuple(map(int, t.split('.'))) for t in tags if VERSION.fullmatch(t)
-                      and tuple(map(int, t.split('.')))[:2] == base[:2] and tuple(map(int, t.split('.'))) > base))
-    return '.'.join(map(str, options[0])) if options else None
+    """Backward-compatible helper for existing users/tests."""
+    return next_version(current, tags, 'patch')
+
 
 def discover(svc):
-    return next_patch(current_version(svc), hub_tags(svc['image']))
+    return next_version(current_version(svc), hub_tags(svc['image']), svc.get('policy', 'patch'))
 
 def sha256(path):
     h = hashlib.sha256()
@@ -254,6 +327,7 @@ def check_bind_source(source, backup_root, allowed_roots, writable):
 
 
 def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
+    """Inspect only target persistence. Refuse data shared with running sibling services."""
     target = svc['compose_service']
     services = config['services']
     if target not in services:
@@ -263,46 +337,59 @@ def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
     if services[target].get('image') != f'{svc["image"]}:{current_version(svc)}':
         raise UpdateError('Target image does not match image:version in config')
     volumes = config.get('volumes', {})
-    for key, value in volumes.items():
-        if value.get('external'):
-            raise UpdateError(f'External volume {key} is unsupported')
     named = set()
     binds = {}
     backup_root = backup_root or Path('/var/backups/svc-update').resolve()
     allowed_roots = [Path(root).resolve(strict=True) for root in allowed_roots]
-    for service_name, service in services.items():
-        # Non-target services may have build:; --no-build prevents building them.
-        for mount in service.get('volumes', []):
-            if not isinstance(mount, dict):
-                raise UpdateError(f'Unsupported volume specification on {service_name}')
-            source = mount.get('source')
-            kind = mount.get('type')
-            if kind == 'volume':
-                if not source or source not in volumes:
-                    raise UpdateError(f'Undeclared/anonymous volume on {service_name}')
-                named.add(source)
-            elif kind == 'bind':
-                writable = not mount.get('read_only', False)
-                resolved = check_bind_source(source, backup_root, allowed_roots, writable)
-                key = str(resolved)
-                existing = binds.get(key)
-                if existing:
-                    existing['writable'] = existing['writable'] or writable
-                else:
-                    binds[key] = {'source': key, 'writable': writable}
+    target_mounts = services[target].get('volumes', [])
+    for mount in target_mounts:
+        if not isinstance(mount, dict):
+            raise UpdateError(f'Unsupported volume specification on {target}')
+        source = mount.get('source')
+        kind = mount.get('type')
+        if kind == 'volume':
+            if not source or source not in volumes:
+                raise UpdateError(f'Undeclared/anonymous volume on {target}')
+            if volumes[source].get('external'):
+                raise UpdateError(f'External volume {source} is unsupported')
+            named.add(source)
+        elif kind == 'bind':
+            writable = not mount.get('read_only', False)
+            resolved = check_bind_source(source, backup_root, allowed_roots, writable)
+            key = str(resolved)
+            if key in binds:
+                binds[key]['writable'] |= writable
             else:
-                raise UpdateError(f'Unsupported mount type {kind!r} on {service_name}')
-    # Never write over overlapping directories during a rollback.
+                binds[key] = {'source': key, 'writable': writable}
+        else:
+            raise UpdateError(f'Unsupported mount type {kind!r} on {target}')
+
     sources = [Path(x) for x in binds]
     for i, one in enumerate(sources):
         for two in sources[i + 1:]:
             if under(one, two) or under(two, one):
                 raise UpdateError(f'Nested bind mounts unsupported: {one} / {two}')
-    # Re-check consolidated access mode (one bind may be shared RO/RW).
     for row in binds.values():
         if row['writable']:
             check_bind_source(row['source'], backup_root, allowed_roots, True)
         row['kind'] = ensure_plain_tree(Path(row['source']))
+
+    # No other service may retain a mounted directory/volume that the target
+    # will restore: that would modify live shared storage behind its back.
+    for sibling, definition in services.items():
+        if sibling == target:
+            continue
+        for mount in definition.get('volumes', []):
+            if not isinstance(mount, dict):
+                raise UpdateError(f'Unsupported volume specification on {sibling}')
+            if mount.get('type') == 'volume' and mount.get('source') in named:
+                raise UpdateError(f'Volume {mount.get("source")} is shared with {sibling}; --no-deps update unsafe')
+            if mount.get('type') == 'bind':
+                other = Path(mount.get('source') or '').resolve()
+                if any(row['writable'] and (under(other, Path(row['source'])) or under(Path(row['source']), other))
+                       for row in binds.values()):
+                    raise UpdateError(f'RW bind path overlaps with {sibling}; --no-deps update unsafe')
+
     names = sorted(volumes[key].get('name', key) for key in named)
     for name in names:
         if not SAFE_NAME.fullmatch(name):
@@ -310,28 +397,31 @@ def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
         data = json.loads(cmd(['docker', 'volume', 'inspect', name]))[0]
         if data.get('Driver') != 'local' or data.get('Options'):
             raise UpdateError(f'Only simple local volumes are supported: {name}')
-    if not names and not binds:
-        raise UpdateError('Stack has no persisted mounts to back up')
-    for service_name in services:
-        cid = compose(svc, 'ps', '-q', service_name)
-        if not cid:
-            raise UpdateError(f'{service_name}: not running, refuse unattended update')
-        state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
-        if not state['Running']:
-            raise UpdateError(f'{service_name}: not running')
-    return {'volumes': names, 'binds': sorted(binds.values(), key=lambda r: r['source'])}
+
+    cid = compose(svc, 'ps', '-q', target)
+    if not cid:
+        raise UpdateError(f'{target}: not running, refuse unattended update')
+    state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
+    if not state['Running']:
+        raise UpdateError(f'{target}: not running')
+    return {'volumes': names, 'binds': sorted(binds.values(), key=lambda row: row['source'])}
 
 def verify_candidate(svc, candidate, config):
-    if not VERSION.fullmatch(candidate):
-        raise UpdateError('Candidate must be a stable X.Y.Z version')
-    old = tuple(map(int, current_version(svc).split('.')))
-    new = tuple(map(int, candidate.split('.')))
-    if old[:2] != new[:2] or new <= old:
-        raise UpdateError('Candidate must be newer within same major/minor series')
+    old, flavor = parse_version(current_version(svc))
+    new, new_flavor = parse_version(candidate)
+    policy = svc.get('policy', 'patch')
+    if new_flavor != flavor or new <= old:
+        raise UpdateError('Candidate must be newer and preserve the image flavor')
+    if policy == 'patch' and old[:2] != new[:2]:
+        raise UpdateError('Patch update cannot change major/minor')
+    if policy == 'minor' and (old[0] != new[0] or new[1] <= old[1]):
+        raise UpdateError('Minor update must increment minor in the same major')
+    if policy == 'major' and new[0] <= old[0]:
+        raise UpdateError('Major update must increment major')
     file = svc['_dir'] / '.candidate.env'
     orig = (svc['_dir'] / 'versions.env').read_text(encoding='utf-8')
-    atom_write(file, re.sub(r'^' + re.escape(svc['version_variable']) + r'=.*$',
-                            svc['version_variable'] + '=' + candidate, orig, flags=re.M))
+    atom_write(file, orig)
+    replace_env(file, svc['version_variable'], candidate)
     try:
         after = compose_config(svc, file)
         if set(after['services']) != set(config['services']) or after.get('volumes') != config.get('volumes'):
@@ -355,7 +445,7 @@ def archive_bind(source, destination):
     ensure_plain_tree(source)
     with tarfile.open(destination, 'w') as tar:
         tar.add(source, arcname='payload', recursive=True)
-    # Files can change mid-archive; all stack containers must be stopped first.
+    # Only the target is stopped; shared RW storage is rejected by inspect_stack.
 
 
 def verify_bind_archive(archive):
@@ -398,7 +488,8 @@ def backup(svc, root, mounts, old, old_image_id):
         verify_bind_archive(path / archive)
         bind_records.append({'source': str(source), 'kind': kind,
                              'archive': archive, 'sha256': sha256(path / archive)})
-    manifest = {'format': 2, 'service': svc['_name'], 'created_at': now(), 'old_version': old,
+    manifest = {'format': 3, 'scope': 'target', 'compose_service': svc['compose_service'],
+                'service': svc['_name'], 'created_at': now(), 'old_version': old,
                 'old_image_id': old_image_id, 'volumes': records, 'binds': bind_records,
                 'versions_sha256': sha256(path / 'versions.env')}
     atom_write(path / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
@@ -442,6 +533,9 @@ def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     if manifest['service'] != svc['_name']:
         raise UpdateError('Wrong backup service')
+    if (manifest.get('format') != 3 or manifest.get('scope') != 'target'
+            or manifest.get('compose_service') != svc['compose_service']):
+        raise UpdateError('Incompatible backup scope; v0.2 full-stack archives require old recovery procedure')
     if sha256(path / 'versions.env') != manifest['versions_sha256']:
         raise UpdateError('Backup versions checksum mismatch')
     for row in manifest['volumes']:
@@ -460,10 +554,11 @@ def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
         check_bind_source(row['source'], backup_root or path.parent.parent, allowed_roots, True)
         if ensure_plain_tree(Path(row['source'])) != row['kind']:
             raise UpdateError(f'Bind source type changed: {row["source"]}')
+    # Stop ONLY the target: dependencies remain running during an upgrade/restore.
+    target = svc['compose_service']
+    compose(svc, 'stop', target, timeout=300)
     if with_versions:
         atom_write(svc['_dir'] / 'versions.env', (path / 'versions.env').read_text(encoding='utf-8'))
-    # Ensure existing containers release bind mounts and volumes before restoring.
-    compose(svc, 'down', '--remove-orphans', timeout=300)
     for row in manifest['volumes']:
         cmd(['docker', 'run', '--rm', '--network', 'none', '--mount', f'type=volume,source={row["volume"]},target=/target',
              '--mount', f'type=bind,source={path},target=/backup,readonly', svc.get('archive_image', 'busybox:1.36.1'),
@@ -473,7 +568,7 @@ def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
     current_id = cmd(['docker', 'image', 'inspect', '-f', '{{.Id}}', f'{svc["image"]}:{manifest["old_version"]}'])
     if current_id != manifest['old_image_id']:
         raise UpdateError('Old image identity changed; manual recovery required')
-    compose(svc, 'up', '-d', '--no-build', '--pull', 'never', timeout=600)
+    compose(svc, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', target, timeout=600)
     health(svc)
 
 def health(svc):
@@ -482,15 +577,17 @@ def health(svc):
     while time.monotonic() < deadline:
         try:
             config = compose_config(svc)
-            for service in config['services']:
-                cid = compose(svc, 'ps', '-q', service)
-                if not cid:
-                    raise UpdateError(f'No container: {service}')
-                state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
-                if not state['Running'] or state.get('Health', {}).get('Status') == 'unhealthy':
-                    raise UpdateError(f'{service} not healthy')
-                if state.get('Health') and state['Health']['Status'] != 'healthy':
-                    raise UpdateError(f'{service} healthcheck pending')
+            service = svc['compose_service']
+            if service not in config['services']:
+                raise UpdateError(f'Missing target service: {service}')
+            cid = compose(svc, 'ps', '-q', service)
+            if not cid:
+                raise UpdateError(f'No container: {service}')
+            state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
+            if not state['Running'] or state.get('Health', {}).get('Status') == 'unhealthy':
+                raise UpdateError(f'{service} not healthy')
+            if state.get('Health') and state['Health']['Status'] != 'healthy':
+                raise UpdateError(f'{service} healthcheck pending')
             url = svc.get('health_url')
             if not url:
                 raise UpdateError('No health_url configured')
@@ -543,7 +640,7 @@ def make_journal(root, svc, stage, **kwargs):
 def do_upgrade(conf, svc, candidate, apply=False):
     old = current_version(svc)
     if not candidate:
-        print(f'{svc["_name"]}: {old}: no newer patch tag')
+        print(f'{svc["_name"]}: {old}: no eligible {svc.get("policy", "patch")} tag')
         return
     if not apply:
         print(f'{svc["_name"]}: DRY RUN {old} -> {candidate}. --apply required for changes')
@@ -563,13 +660,13 @@ def do_upgrade(conf, svc, candidate, apply=False):
     changed = False
     try:
         make_journal(root, svc, 'stopping', old=old, new=candidate)
-        compose(svc, 'stop', timeout=360)
+        compose(svc, 'stop', svc['compose_service'], timeout=360)
         make_journal(root, svc, 'backing_up', old=old, new=candidate)
         backup_dir = backup(svc, root, mounts, old, previous_id)
         make_journal(root, svc, 'deploying', old=old, new=candidate, backup=str(backup_dir))
         replace_env(svc['_dir'] / 'versions.env', svc['version_variable'], candidate)
         changed = True
-        compose(svc, 'up', '-d', '--no-build', '--pull', 'never', timeout=600)
+        compose(svc, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', svc['compose_service'], timeout=600)
         health(svc)
         make_journal(root, svc, 'committed', old=old, new=candidate, backup=str(backup_dir))
         emit(conf, f'SUCCESS {svc["_name"]} {old} -> {candidate}', f'Backup: {backup_dir}')
@@ -588,7 +685,7 @@ def do_upgrade(conf, svc, candidate, apply=False):
         else:
             try:
                 if journal.exists():
-                    compose(svc, 'start', timeout=300)
+                    compose(svc, 'start', svc['compose_service'], timeout=300)
                     health(svc)
                     journal.unlink(missing_ok=True)
             except Exception as recovery_exc:
@@ -656,7 +753,7 @@ def main():
                         raise UpdateError('Interrupted transaction; inspect journal before proceeding')
                     candidate = discover(svc)
                     if args.action == 'check':
-                        print(f'{name}: {old} -> {candidate or "no eligible patch"}')
+                        print(f'{name}: {old} -> {candidate or "no eligible update"}')
                     else:
                         do_upgrade(conf, svc, candidate, args.apply)
             except Exception as exc:
