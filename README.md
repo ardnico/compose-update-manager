@@ -2,6 +2,8 @@
 
 A conservative updater for Docker Compose services that use **public Docker Hub** images directly or build their own images from a public Docker Hub base. Requires Python 3.11+, Docker Engine, the Docker Compose plugin and systemd on Linux. Python standard library only.
 
+For installation, configuration, log queries, and recovery procedures in Japanese, see the [operations manual](doc/README.md).
+
 Validate each target's update and recovery on a disposable Compose stack before enabling unattended updates. See [Server validation](#server-validation) for the BusyBox test results.
 
 ## New in v0.3
