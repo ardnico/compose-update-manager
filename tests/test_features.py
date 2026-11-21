@@ -94,9 +94,9 @@ class TargetOnly(unittest.TestCase):
                     return ''
                 return 'cid'
             with patch.object(mod, 'compose', side_effect=fake_compose), \
-                 patch.object(mod, 'compose_config', return_value={'services': {}}), \
+                 patch.object(mod, 'compose_config', return_value={'services': {'nginx': {'image': 'nginx:1.2.3'}}}), \
                  patch.object(mod, 'inspect_stack', return_value={'volumes': [], 'binds': []}), \
-                 patch.object(mod, 'verify_candidate'), \
+                 patch.object(mod, 'verify_candidate', return_value='nginx:1.2.4'), \
                  patch.object(mod, 'cmd', return_value='sha256:test'), \
                  patch.object(mod, 'backup', return_value=root / 'dummy'), \
                  patch.object(mod, 'health'), \
@@ -129,6 +129,10 @@ class TargetOnly(unittest.TestCase):
             self.assertEqual((root / 'versions.env').read_text(), old_versions)
             self.assertEqual(events, [('stop', 'nginx'),
                 ('up', '-d', '--no-deps', '--no-build', '--pull', 'never', 'nginx')])
+            with patch.object(mod, 'compose') as run, patch.object(mod, 'tagged_image_id', return_value=None):
+                with self.assertRaisesRegex(mod.UpdateError, 'Old image is missing or changed'):
+                    mod.restore(svc, path)
+                run.assert_not_called()
 
     def test_old_backup_rejected_before_any_changes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -139,6 +143,47 @@ class TargetOnly(unittest.TestCase):
                 with self.assertRaisesRegex(mod.UpdateError, 'Incompatible backup scope'):
                     mod.restore(svc, root)
                 run.assert_not_called()
+
+
+class LocalBuild(unittest.TestCase):
+    def test_candidate_may_only_change_output_tag_and_base_argument(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            env = root / 'versions.env'
+            env.write_text('BASE_VERSION=1.2.3\n')
+            svc = {'_dir': root, 'image': 'busybox', 'version_variable': 'BASE_VERSION',
+                   'compose_service': 'app', 'local_build': {'base_argument': 'BASE_IMAGE'}}
+            old = {'services': {'app': {'image': 'my-app:release-1.2.3',
+                                        'build': {'args': {'BASE_IMAGE': 'busybox:1.2.3', 'OTHER': 'fixed'}}}}}
+            new = {'services': {'app': {'image': 'my-app:release-1.2.4',
+                                        'build': {'args': {'BASE_IMAGE': 'busybox:1.2.4', 'OTHER': 'fixed'}}}}}
+            with patch.object(mod, 'compose_config', return_value=new):
+                self.assertEqual(mod.verify_candidate(svc, '1.2.4', old, env), 'my-app:release-1.2.4')
+                new['services']['app']['build']['args']['OTHER'] = 'changed'
+                with self.assertRaisesRegex(mod.UpdateError, 'changes settings outside'):
+                    mod.verify_candidate(svc, '1.2.4', old, env)
+
+
+class ImageRetention(unittest.TestCase):
+    def test_only_expired_matching_unused_tags_are_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / 'web' / 'image-history.json'
+            other = root / 'worker' / path.name
+            history = [{'ref': f'app:{tag}', 'id': f'sha256:{tag}'}
+                       for tag in ['previous', 'busy', 'shared', 'moved', 'expired']]
+            mod.write_image_history(path, history)
+            mod.write_image_history(other, [{'ref': 'docker.io/library/app:shared', 'id': 'sha256:shared'}])
+            svc = {'_name': 'web', 'keep_previous_images': 1}
+            conf = {'services': {'web': svc, 'worker': {'keep_previous_images': 1}}}
+            found = {'app:busy': 'sha256:busy', 'app:moved': 'sha256:changed', 'app:expired': 'sha256:expired'}
+            with patch.object(mod, 'tagged_image_id', side_effect=found.__getitem__), \
+                 patch.object(mod, 'containers_using_tag', side_effect=lambda ref, _: ref == 'app:busy'), \
+                 patch.object(mod, 'cmd') as command, patch('builtins.print'):
+                mod.prune_images(conf, svc, path, 'app:current')
+            command.assert_called_once_with(['docker', 'image', 'rm', '--no-prune', 'app:expired'])
+            self.assertEqual(mod.image_history(path), history[:3])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -22,8 +22,27 @@ directory = "/srv/containers/nginx"
 # compose_file = "docker-compose.yml"
 # compose_files = ["compose.yaml", "compose.override.yaml"]
 version_variable = "NGINX_VERSION"
+# Keep the immediately previous image as well as the running image.
+# Omit this setting to keep all previous images.
+keep_previous_images = 1
 archive_image = "busybox:1.36.1"
 health_url = "http://127.0.0.1:18080/"
 health_timeout_seconds = 90
 # To allow automated major/latest updates (high risk):
 # allow_breaking_auto_update = true
+
+[services.app]
+enabled = false
+auto_update = false
+policy = "patch"
+image = "busybox" # Docker Hub base repository used in the Dockerfile
+compose_service = "app"
+directory = "/srv/containers/app"
+compose_file = "docker-compose.yml"
+version_variable = "APP_BASE_VERSION"
+keep_previous_images = 2
+health_url = "http://127.0.0.1:18081/"
+
+[services.app.local_build]
+# Set build.args.BASE_IMAGE to busybox:${APP_BASE_VERSION} in Compose.
+base_argument = "BASE_IMAGE"

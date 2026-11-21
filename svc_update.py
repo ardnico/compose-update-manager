@@ -15,21 +15,32 @@ import smtplib
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from email.message import EmailMessage
+from typing import NamedTuple
 
 VERSION = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([a-z0-9][a-z0-9._-]*))?$')
 POLICIES = {'patch', 'minor', 'major', 'any', 'latest'}
 COMPOSE_NAMES = ('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')
 VARIABLE = re.compile(r'^[A-Z][A-Z0-9_]*$')
 SAFE_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+LOCAL_IMAGE = re.compile(r'(?:[a-z0-9.-]+:\d+/)?[a-z0-9][a-z0-9._/-]*(?::[\w][A-Za-z0-9_.-]{0,127})?', re.ASCII)
 
 class UpdateError(RuntimeError):
     pass
+
+
+class ImageVersion(NamedTuple):
+    version: str
+    ref: str
+    id: str
+
 
 def now():
     return dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -52,7 +63,10 @@ def cmd(args, cwd=None, output=True, timeout=240, clean_keys=()):
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                           env={k: v for k, v in os.environ.items() if k not in {'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', *clean_keys}})
     if proc.returncode:
-        raise UpdateError(f'Command failed ({proc.returncode}): {" ".join(args[:6])}\n{proc.stderr[-1800:]}')
+        details = proc.stderr.strip() or proc.stdout.strip()
+        if len(details) > 1800:
+            details = f'{details[:1200]}\n...\n{details[-600:]}'
+        raise UpdateError(f'Command failed ({proc.returncode}): {" ".join(args[:6])}\n{details}')
     return proc.stdout.strip() if output else ''
 
 def parse_env(path):
@@ -131,6 +145,9 @@ def load_config(path):
             raise UpdateError('Invalid service name')
         svc['_name'] = name
         svc['_dir'] = Path(svc['directory']).resolve()
+        keep = svc.get('keep_previous_images')
+        if keep is not None and (type(keep) is not int or keep < 0):
+            raise UpdateError(f'{name}: keep_previous_images must be a nonnegative integer')
         if not svc.get('enabled', False):
             continue
         if not svc['_dir'].is_dir():
@@ -150,15 +167,19 @@ def load_config(path):
             raise UpdateError('Unsupported image repository')
         if not SAFE_NAME.fullmatch(svc['compose_service']):
             raise UpdateError('Invalid compose_service')
+        if 'local_build' in svc:
+            build = svc['local_build']
+            if not isinstance(build, dict) or not VARIABLE.fullmatch(str(build.get('base_argument', ''))):
+                raise UpdateError(f'{name}: set local_build.base_argument to a Dockerfile ARG name')
     return conf
 
 
-def compose(svc, *args, version_file=None, timeout=240):
+def compose(svc, *args, version_file=None, extra_files=(), timeout=240):
     directory = svc['_dir']
     version_file = version_file or directory / 'versions.env'
     keys = set(parse_env(directory / '.env')) | set(parse_env(version_file))
     files = svc.get('_compose_files') or select_compose_files(directory, svc)
-    flags = [arg for file in files for arg in ('-f', str(file))]
+    flags = [arg for file in (*files, *extra_files) for arg in ('-f', str(file))]
     return cmd(['docker', 'compose', '--project-directory', str(directory), *flags,
                 '--env-file', str(directory / '.env'), '--env-file', str(version_file), *args],
                cwd=directory, timeout=timeout, clean_keys=keys)
@@ -326,16 +347,58 @@ def check_bind_source(source, backup_root, allowed_roots, writable):
     return resolved
 
 
-def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
-    """Inspect only target persistence. Refuse data shared with running sibling services."""
+def image_key(ref):
+    repo, colon, tag = ref.rpartition(':')
+    if not colon or '/' in tag:
+        repo, tag = ref, 'latest'
+    if repo.startswith(('docker.io/', 'index.docker.io/')):
+        repo = repo.split('/', 1)[1]
+    if '/' not in repo:
+        repo = 'library/' + repo
+    return f'{repo}:{tag}'
+
+
+def target_image(svc, config, version):
     target = svc['compose_service']
     services = config['services']
     if target not in services:
         raise UpdateError(f'Target {target} missing in compose config')
-    if services[target].get('build'):
-        raise UpdateError('Target service with build: is not supported')
-    if services[target].get('image') != f'{svc["image"]}:{current_version(svc)}':
-        raise UpdateError('Target image does not match image:version in config')
+    definition = services[target]
+    ref = definition.get('image', '')
+    build = definition.get('build')
+    upstream = f'{svc["image"]}:{version}'
+    if 'local_build' not in svc:
+        if build:
+            raise UpdateError('Set local_build to manage a target with build:')
+        if ref != upstream:
+            raise UpdateError('Target image does not match image:version in config')
+        return ref
+
+    if not LOCAL_IMAGE.fullmatch(ref) or not build:
+        raise UpdateError('Local build requires Compose image: and build:')
+    if ':' not in ref.rsplit('/', 1)[-1]:
+        ref += ':latest'
+    base_arg = svc['local_build']['base_argument']
+    if build.get('args', {}).get(base_arg) != upstream:
+        raise UpdateError(f'Compose build.args.{base_arg} must resolve to {upstream}')
+    extra_contexts = build.get('additional_contexts', {})
+    if build.get('tags') or any(context.startswith('service:') for context in extra_contexts.values()):
+        raise UpdateError('Local build cannot tag extra images or build other Compose services')
+    key = image_key(ref)
+    repo = key.rsplit(':', 1)[0]
+    if repo in {image_key(upstream).rsplit(':', 1)[0], 'library/svc-update-build', 'library/svc-update-history'}:
+        raise UpdateError('Local output repository must differ from the base and updater repositories')
+    if any(image_key(other['image']) == key for name, other in services.items()
+           if name != target and other.get('image')):
+        raise UpdateError('Local output image is shared with another Compose service')
+    return ref
+
+
+def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
+    """Inspect only target persistence. Refuse data shared with running sibling services."""
+    target = svc['compose_service']
+    services = config['services']
+    target_image(svc, config, current_version(svc))
     volumes = config.get('volumes', {})
     named = set()
     binds = {}
@@ -398,15 +461,42 @@ def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
         if data.get('Driver') != 'local' or data.get('Options'):
             raise UpdateError(f'Only simple local volumes are supported: {name}')
 
-    cid = compose(svc, 'ps', '-q', target)
-    if not cid:
-        raise UpdateError(f'{target}: not running, refuse unattended update')
-    state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
-    if not state['Running']:
+    container = target_container(svc)
+    if not container['State']['Running']:
         raise UpdateError(f'{target}: not running')
-    return {'volumes': names, 'binds': sorted(binds.values(), key=lambda row: row['source'])}
+    return {'volumes': names, 'binds': sorted(binds.values(), key=lambda row: row['source']),
+            'running_image_id': container.get('Image')}
 
-def verify_candidate(svc, candidate, config):
+
+def target_container(svc):
+    target = svc['compose_service']
+    ids = compose(svc, 'ps', '-q', target).splitlines()
+    if len(ids) != 1:
+        raise UpdateError(f'{target}: expected one running container')
+    return json.loads(cmd(['docker', 'inspect', ids[0]]))[0]
+
+
+def image_id(ref):
+    return cmd(['docker', 'image', 'inspect', '-f', '{{.Id}}', ref])
+
+
+def tagged_image_id(ref):
+    # The reference lookup returns an empty result when the tag is absent.
+    if cmd(['docker', 'image', 'ls', '--quiet', '--no-trunc', ref]):
+        return image_id(ref)
+    return None
+
+
+@contextmanager
+def candidate_env(svc, candidate):
+    with tempfile.TemporaryDirectory(prefix='svc-update-') as temp:
+        file = Path(temp) / 'versions.env'
+        atom_write(file, (svc['_dir'] / 'versions.env').read_text(encoding='utf-8'))
+        replace_env(file, svc['version_variable'], candidate)
+        yield file
+
+
+def verify_candidate(svc, candidate, config, file):
     old, flavor = parse_version(current_version(svc))
     new, new_flavor = parse_version(candidate)
     policy = svc.get('policy', 'patch')
@@ -418,27 +508,35 @@ def verify_candidate(svc, candidate, config):
         raise UpdateError('Minor update must increment minor in the same major')
     if policy == 'major' and new[0] <= old[0]:
         raise UpdateError('Major update must increment major')
-    file = svc['_dir'] / '.candidate.env'
-    orig = (svc['_dir'] / 'versions.env').read_text(encoding='utf-8')
-    atom_write(file, orig)
-    replace_env(file, svc['version_variable'], candidate)
-    try:
-        after = compose_config(svc, file)
-        if set(after['services']) != set(config['services']) or after.get('volumes') != config.get('volumes'):
-            raise UpdateError('Candidate changes stack topology')
-        target = svc['compose_service']
-        for name in config['services']:
-            prior = config['services'][name].copy()
-            future = after['services'][name].copy()
-            if name == target:
-                if future.get('image') != f'{svc["image"]}:{candidate}':
-                    raise UpdateError('Candidate image interpolation wrong')
-                prior.pop('image', None)
-                future.pop('image', None)
-            if prior != future:
-                raise UpdateError(f'Candidate changes non-image settings on {name}')
-    finally:
-        file.unlink(missing_ok=True)
+    after = compose_config(svc, file)
+    prior_resources = {k: v for k, v in config.items() if k != 'services'}
+    next_resources = {k: v for k, v in after.items() if k != 'services'}
+    if prior_resources != next_resources or set(after['services']) != set(config['services']):
+        raise UpdateError('Candidate changes stack topology')
+    ref = target_image(svc, after, candidate)
+    for name in config['services']:
+        prior = config['services'][name].copy()
+        future = after['services'][name].copy()
+        if name == svc['compose_service']:
+            prior.pop('image', None)
+            future.pop('image', None)
+            if 'local_build' in svc:
+                base_arg = svc['local_build']['base_argument']
+                for definition in (prior, future):
+                    build = definition['build']
+                    definition['build'] = {**build, 'args': {k: v for k, v in build['args'].items() if k != base_arg}}
+        if prior != future:
+            raise UpdateError(f'Candidate changes settings outside the managed image or base argument on {name}')
+    return ref
+
+
+def build_candidate(svc, version_file, staged_ref):
+    # A separate output tag keeps the currently deployed tag available until backup completes.
+    overlay = version_file.with_name('build.json')
+    overlay.write_text(json.dumps({'services': {svc['compose_service']: {'image': staged_ref}}}), encoding='utf-8')
+    compose(svc, 'build', '--pull', svc['compose_service'], version_file=version_file,
+            extra_files=(overlay,), timeout=3600)
+    return image_id(staged_ref)
 
 def archive_bind(source, destination):
     """Archive a host file/directory under payload/, including metadata."""
@@ -461,7 +559,7 @@ def verify_bind_archive(archive):
                 raise UpdateError(f'Unsafe bind archive member: {member.name}')
 
 
-def backup(svc, root, mounts, old, old_image_id):
+def backup(svc, root, mounts, old, old_image_id, *, local_image=None, old_image_ref=None):
     path = root / svc['_name'] / now()
     path.mkdir(parents=True, exist_ok=False, mode=0o700)
     shutil.copy2(svc['_dir'] / 'versions.env', path / 'versions.env')
@@ -492,6 +590,8 @@ def backup(svc, root, mounts, old, old_image_id):
                 'service': svc['_name'], 'created_at': now(), 'old_version': old,
                 'old_image_id': old_image_id, 'volumes': records, 'binds': bind_records,
                 'versions_sha256': sha256(path / 'versions.env')}
+    if local_image is not None:
+        manifest.update(local_image=local_image, old_image_ref=old_image_ref)
     atom_write(path / 'manifest.json', json.dumps(manifest, indent=2) + '\n')
     return path
 
@@ -538,6 +638,18 @@ def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
         raise UpdateError('Incompatible backup scope; v0.2 full-stack archives require old recovery procedure')
     if sha256(path / 'versions.env') != manifest['versions_sha256']:
         raise UpdateError('Backup versions checksum mismatch')
+    expected_id = manifest['old_image_id']
+    old_ref = manifest.get('old_image_ref', f'{svc["image"]}:{manifest["old_version"]}')
+    local_image = manifest.get('local_image')
+    if local_image is not None:
+        versions = path / 'versions.env' if with_versions else None
+        restore_ref = target_image(svc, compose_config(svc, versions), manifest['old_version'])
+        if image_key(restore_ref) != image_key(local_image):
+            raise UpdateError('Backup local image does not match the current Compose definition')
+        if tagged_image_id(local_image) == expected_id:
+            old_ref = local_image
+    if tagged_image_id(old_ref) != expected_id:
+        raise UpdateError(f'Old image is missing or changed ({old_ref}); manual recovery required')
     for row in manifest['volumes']:
         if sha256(path / row['archive']) != row['sha256']:
             raise UpdateError('Backup archive checksum mismatch')
@@ -565,13 +677,12 @@ def restore(svc, path, with_versions=True, allowed_roots=(), backup_root=None):
              'sh', '-c', f'cd /target && rm -rf -- ./* ./.[!.]* ./..?* && tar -xpf /backup/{row["archive"]}'], timeout=3600)
     for row in manifest.get('binds', []):
         replace_bind_from_archive(path / row['archive'], Path(row['source']), row['kind'])
-    current_id = cmd(['docker', 'image', 'inspect', '-f', '{{.Id}}', f'{svc["image"]}:{manifest["old_version"]}'])
-    if current_id != manifest['old_image_id']:
-        raise UpdateError('Old image identity changed; manual recovery required')
+    if local_image is not None and image_key(old_ref) != image_key(local_image):
+        cmd(['docker', 'image', 'tag', expected_id, local_image])
     compose(svc, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', target, timeout=600)
-    health(svc)
+    health(svc, expected_id)
 
-def health(svc):
+def health(svc, expected_image_id=None):
     deadline = time.monotonic() + int(svc.get('health_timeout_seconds', 150))
     last = 'not yet checked'
     while time.monotonic() < deadline:
@@ -580,10 +691,10 @@ def health(svc):
             service = svc['compose_service']
             if service not in config['services']:
                 raise UpdateError(f'Missing target service: {service}')
-            cid = compose(svc, 'ps', '-q', service)
-            if not cid:
-                raise UpdateError(f'No container: {service}')
-            state = json.loads(cmd(['docker', 'inspect', cid]))[0]['State']
+            container = target_container(svc)
+            if expected_image_id is not None and container['Image'] != expected_image_id:
+                raise UpdateError(f'{service} is running an unexpected image')
+            state = container['State']
             if not state['Running'] or state.get('Health', {}).get('Status') == 'unhealthy':
                 raise UpdateError(f'{service} not healthy')
             if state.get('Health') and state['Health']['Status'] != 'healthy':
@@ -637,6 +748,72 @@ def make_journal(root, svc, stage, **kwargs):
     atom_write(state, json.dumps({'stage': stage, 'time': now(), **kwargs}, indent=2) + '\n')
     return state
 
+
+def image_history(path):
+    if path.exists():
+        return json.loads(path.read_text(encoding='utf-8'))
+    return []
+
+
+def write_image_history(path, history):
+    atom_write(path, json.dumps(history, indent=2) + '\n')
+
+
+def record_previous_image(path, old_ref, old_id, current_ref):
+    replaced = {image_key(old_ref), image_key(current_ref)}
+    history = [row for row in image_history(path) if image_key(row['ref']) not in replaced]
+    write_image_history(path, [{'ref': old_ref, 'id': old_id}, *history])
+
+
+def containers_using_tag(ref, docker_image_id):
+    ids = cmd(['docker', 'ps', '-aq', '--filter', f'ancestor={docker_image_id}']).splitlines()
+    if not ids:
+        return []
+    containers = json.loads(cmd(['docker', 'container', 'inspect', *ids]))
+    return [row for row in containers if image_key(row['Config']['Image']) == image_key(ref)]
+
+
+def prune_images(conf, svc, path, current_ref):
+    keep = svc.get('keep_previous_images')
+    if keep is None:
+        return
+    history = image_history(path)
+    protected = {image_key(current_ref)}
+    for name, other in conf.get('services', {}).items():
+        if name != svc['_name']:
+            other_history = image_history(path.parent.parent / name / path.name)
+            protected.update(image_key(row['ref']) for row in other_history[:other.get('keep_previous_images')])
+    remaining = history[:keep]
+    for row in history[keep:]:
+        ref = row['ref']
+        try:
+            if image_key(ref) in protected:
+                remaining.append(row)
+                continue
+            if tagged_image_id(ref) != row['id']:
+                continue  # Removed or retagged since the update.
+            if containers_using_tag(ref, row['id']):
+                remaining.append(row)
+                print(f'{svc["_name"]}: retained {ref} (used by a container)')
+                continue
+            cmd(['docker', 'image', 'rm', '--no-prune', ref])
+            print(f'{svc["_name"]}: removed old image {ref}')
+        except (UpdateError, OSError, subprocess.TimeoutExpired) as exc:
+            remaining.append(row)
+            print(f'WARNING: could not remove old image {ref}: {exc}', file=sys.stderr)
+    if remaining != history:
+        write_image_history(path, remaining)
+
+
+def remove_temporary_image(ref, expected_id=None):
+    try:
+        found = tagged_image_id(ref)
+        if found and (expected_id is None or found == expected_id):
+            cmd(['docker', 'image', 'rm', '--no-prune', ref])
+    except (UpdateError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f'WARNING: could not remove temporary image {ref}: {exc}', file=sys.stderr)
+
+
 def do_upgrade(conf, svc, candidate, apply=False):
     old = current_version(svc)
     if not candidate:
@@ -651,32 +828,92 @@ def do_upgrade(conf, svc, candidate, apply=False):
         raise UpdateError(f'Existing interrupted transaction: {journal}. Manual review required')
     config = compose_config(svc)
     mounts = inspect_stack(svc, config, root, conf['global'].get('allowed_bind_roots', []))
-    verify_candidate(svc, candidate, config)
-    # All network/pull work happens before any outage.
-    cmd(['docker', 'pull', f'{svc["image"]}:{candidate}'], timeout=1200)
-    cmd(['docker', 'pull', svc.get('archive_image', 'busybox:1.36.1')], timeout=1200)
-    previous_id = cmd(['docker', 'image', 'inspect', '-f', '{{.Id}}', f'{svc["image"]}:{old}'])
+    old_ref = target_image(svc, config, old)
+    previous_id = image_id(old_ref)
+    if mounts.get('running_image_id') not in (None, previous_id):
+        raise UpdateError(f'Running container does not match the configured image {old_ref}')
+    local = 'local_build' in svc
+    staged_ref = archive_ref = new_ref = new_id = None
+    existing_new_id = None
+    committed = False
+    try:
+        # Resolve and build/pull the candidate while the old container is running.
+        with candidate_env(svc, candidate) as version_file:
+            new_ref = verify_candidate(svc, candidate, config, version_file)
+            if local:
+                existing_new_id = tagged_image_id(new_ref)
+                if image_key(old_ref) == image_key(new_ref):
+                    running = target_container(svc)['Id']
+                    if any(row['Id'] != running for row in containers_using_tag(old_ref, previous_id)):
+                        raise UpdateError(f'Local image tag {old_ref} is shared with another container')
+                staged_ref = f'svc-update-build:{uuid.uuid4().hex}'
+                new_id = build_candidate(svc, version_file, staged_ref)
+                if image_key(old_ref) == image_key(new_ref):
+                    archive_ref = f'svc-update-history:{uuid.uuid4().hex}'
+                    cmd(['docker', 'image', 'tag', previous_id, archive_ref])
+                elif existing_new_id not in (None, new_id):
+                    raise UpdateError(f'Candidate local image tag already exists with a different image: {new_ref}')
+            else:
+                cmd(['docker', 'pull', new_ref], timeout=1200)
+                new_id = image_id(new_ref)
+        if mounts['volumes']:
+            cmd(['docker', 'pull', svc.get('archive_image', 'busybox:1.36.1')], timeout=1200)
+        if image_id(old_ref) != previous_id:
+            raise UpdateError(f'Configured image tag changed during preparation: {old_ref}')
+        previous = ImageVersion(old, archive_ref or old_ref, previous_id)
+        upcoming = ImageVersion(candidate, new_ref, new_id)
+        backup_dir = deploy_update(conf, svc, mounts, previous, upcoming, old_ref, existing_new_id)
+        committed = True
+    finally:
+        if staged_ref:
+            remove_temporary_image(staged_ref, new_id)
+        if archive_ref and not committed and not journal.exists():
+            remove_temporary_image(archive_ref, previous_id)
+    journal.unlink(missing_ok=True)
+    message = f'Backup: {backup_dir}'
+    if local:
+        message += f'\nLocal image: {new_ref}\nBase image: {svc["image"]}:{candidate}'
+    emit(conf, f'SUCCESS {svc["_name"]} {old} -> {candidate}', message)
+    try:
+        prune_images(conf, svc, journal.with_name('image-history.json'), new_ref)
+    except (UpdateError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f'WARNING: image cleanup failed: {exc}', file=sys.stderr)
+
+
+def deploy_update(conf, svc, mounts, previous, upcoming, old_ref, existing_new_id):
+    root = conf['_backup_root']
+    journal = root / svc['_name'] / 'inflight.json'
+    local = 'local_build' in svc
+    if local and tagged_image_id(upcoming.ref) != existing_new_id:
+        raise UpdateError(f'Candidate local image tag changed during preparation: {upcoming.ref}')
+    old, candidate = previous.version, upcoming.version
     backup_dir = None
     changed = False
+    created_tag = False
     try:
         make_journal(root, svc, 'stopping', old=old, new=candidate)
         compose(svc, 'stop', svc['compose_service'], timeout=360)
         make_journal(root, svc, 'backing_up', old=old, new=candidate)
-        backup_dir = backup(svc, root, mounts, old, previous_id)
+        backup_dir = backup(svc, root, mounts, old, previous.id,
+                            local_image=old_ref if local else None, old_image_ref=previous.ref)
         make_journal(root, svc, 'deploying', old=old, new=candidate, backup=str(backup_dir))
-        replace_env(svc['_dir'] / 'versions.env', svc['version_variable'], candidate)
         changed = True
+        if local:
+            cmd(['docker', 'image', 'tag', upcoming.id, upcoming.ref])
+            created_tag = existing_new_id is None
+        replace_env(svc['_dir'] / 'versions.env', svc['version_variable'], candidate)
         compose(svc, 'up', '-d', '--no-deps', '--no-build', '--pull', 'never', svc['compose_service'], timeout=600)
-        health(svc)
+        health(svc, upcoming.id)
         make_journal(root, svc, 'committed', old=old, new=candidate, backup=str(backup_dir))
-        emit(conf, f'SUCCESS {svc["_name"]} {old} -> {candidate}', f'Backup: {backup_dir}')
-        journal.unlink(missing_ok=True)
+        record_previous_image(journal.with_name('image-history.json'), previous.ref, previous.id, upcoming.ref)
     except Exception as exc:
         failure = str(exc)
         if backup_dir and changed:
             try:
                 make_journal(root, svc, 'rolling_back', old=old, new=candidate, backup=str(backup_dir), failure=failure)
                 restore(svc, backup_dir, allowed_roots=conf['global'].get('allowed_bind_roots', []), backup_root=root)
+                if created_tag:
+                    remove_temporary_image(upcoming.ref, upcoming.id)
                 emit(conf, f'ROLLED BACK {svc["_name"]}', f'Update failed: {failure}\nRestore verified. Backup: {backup_dir}')
                 journal.unlink(missing_ok=True)
             except Exception as restore_exc:
@@ -693,6 +930,7 @@ def do_upgrade(conf, svc, candidate, apply=False):
                 raise
             emit(conf, f'ABORTED {svc["_name"]}', f'{failure}\nNo new version deployed.')
         raise UpdateError(f'Upgrade failed: {failure}') from exc
+    return backup_dir
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
