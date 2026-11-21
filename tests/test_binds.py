@@ -49,6 +49,79 @@ class TestBinds(unittest.TestCase):
                 mod.check_bind_source(data, root / 'backups', [], True)
             self.assertEqual(mod.check_bind_source(data, root / 'backups', [], False), data)
 
+    def test_rw_accepts_string_allowlist_for_update_and_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            data = allowed / 'app'
+            data.mkdir(parents=True)
+            backups = root / 'backups'
+            backups.mkdir()
+            self.assertEqual(mod.check_bind_source(data, backups, [str(allowed)], True), data)
+            with self.assertRaisesRegex(mod.UpdateError, 'outside allowed_bind_roots'):
+                mod.check_bind_source(data, backups, [str(root / 'backups')], True)
+
+    def test_restore_with_string_allowed_root_restores_bind_and_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            data = allowed / 'app'
+            data.mkdir(parents=True)
+            (data / 'record.txt').write_text('before')
+            project = root / 'project'
+            project.mkdir()
+            versions = project / 'versions.env'
+            versions.write_text('APP_VERSION=1.34.0\n')
+            backups = root / 'backups'
+            archive_dir = backups / 'app' / '20261121T000000Z'
+            archive_dir.mkdir(parents=True)
+            archive = archive_dir / 'bind-00.tar'
+            mod.archive_bind(data, archive)
+            (archive_dir / 'versions.env').write_text('APP_VERSION=1.34.0\n')
+            manifest = {'format': 3, 'scope': 'target', 'service': 'app', 'compose_service': 'app',
+                        'old_version': '1.34.0', 'old_image_id': 'sha256:old', 'volumes': [],
+                        'binds': [{'source': str(data), 'kind': 'directory', 'archive': archive.name,
+                                   'sha256': mod.sha256(archive)}],
+                        'versions_sha256': mod.sha256(archive_dir / 'versions.env')}
+            (archive_dir / 'manifest.json').write_text(json.dumps(manifest))
+            (data / 'record.txt').write_text('after')
+            (data / 'new.txt').write_text('new version')
+            versions.write_text('APP_VERSION=1.34.1\n')
+            svc = {'_name': 'app', '_dir': project, 'compose_service': 'app', 'image': 'busybox'}
+            with patch.object(mod, 'tagged_image_id', return_value='sha256:old'), \
+                 patch.object(mod, 'compose') as compose, patch.object(mod, 'health') as health:
+                mod.restore(svc, archive_dir, allowed_roots=[str(allowed)], backup_root=backups)
+            self.assertEqual((data / 'record.txt').read_text(), 'before')
+            self.assertFalse((data / 'new.txt').exists())
+            self.assertEqual(versions.read_text(), 'APP_VERSION=1.34.0\n')
+            self.assertEqual(compose.call_count, 2)
+            health.assert_called_once_with(svc, 'sha256:old')
+
+    def test_restore_refuses_outside_root_before_stopping_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / 'outside' / 'app'
+            data.mkdir(parents=True)
+            archive_dir = root / 'backups' / 'app' / '20261121T000000Z'
+            archive_dir.mkdir(parents=True)
+            archive = archive_dir / 'bind-00.tar'
+            mod.archive_bind(data, archive)
+            (archive_dir / 'versions.env').write_text('APP_VERSION=1.34.0\n')
+            (archive_dir / 'manifest.json').write_text(json.dumps({
+                'format': 3, 'scope': 'target', 'service': 'app', 'compose_service': 'app',
+                'old_version': '1.34.0', 'old_image_id': 'sha256:old', 'volumes': [],
+                'binds': [{'source': str(data), 'kind': 'directory', 'archive': archive.name,
+                           'sha256': mod.sha256(archive)}],
+                'versions_sha256': mod.sha256(archive_dir / 'versions.env')}))
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            svc = {'_name': 'app', '_dir': root, 'compose_service': 'app', 'image': 'busybox'}
+            with patch.object(mod, 'tagged_image_id', return_value='sha256:old'), \
+                 patch.object(mod, 'compose') as compose:
+                with self.assertRaisesRegex(mod.UpdateError, 'outside allowed_bind_roots'):
+                    mod.restore(svc, archive_dir, allowed_roots=[str(allowed)], backup_root=root / 'backups')
+            compose.assert_not_called()
+
     def test_reject_nested_binds_and_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

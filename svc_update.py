@@ -132,11 +132,7 @@ def load_config(path):
     root.mkdir(parents=True, exist_ok=True)
     conf['_backup_root'] = root
     allowlist = conf['global'].get('allowed_bind_roots', [])
-    if not isinstance(allowlist, list) or any(not isinstance(v, str) or not Path(v).is_absolute() or not Path(v).is_dir() for v in allowlist):
-        raise UpdateError('global.allowed_bind_roots must list existing absolute directories')
-    for v in allowlist:
-        if Path(v).resolve() == Path('/') or any(p.is_symlink() for p in (Path(v), *Path(v).parents)):
-            raise UpdateError(f'Unsafe allowed_bind_roots entry: {v}')
+    normalize_allowed_roots(allowlist)
     services = conf.get('services', {})
     if not services:
         raise UpdateError('No [services.*] configured')
@@ -307,6 +303,22 @@ def under(path, root):
     return path == root or root in path.parents
 
 
+def normalize_allowed_roots(roots):
+    """Validate and canonicalize the allowlist at every update/restore entry point."""
+    if not isinstance(roots, (list, tuple)) or any(
+        not isinstance(root, (str, Path)) or not Path(root).is_absolute() or not Path(root).is_dir()
+        for root in roots
+    ):
+        raise UpdateError('global.allowed_bind_roots must list existing absolute directories')
+    result = []
+    for root in roots:
+        path = Path(root)
+        if path.resolve(strict=True) == Path('/') or any(p.is_symlink() for p in (path, *path.parents)):
+            raise UpdateError(f'Unsafe allowed_bind_roots entry: {root}')
+        result.append(path.resolve(strict=True))
+    return result
+
+
 def ensure_plain_tree(source):
     """Refuse symlinks/special files; bind data must be a normal tree."""
     if source.is_symlink():
@@ -338,9 +350,10 @@ def check_bind_source(source, backup_root, allowed_roots, writable):
     if resolved == Path('/') or under(backup_root, resolved) or under(resolved, backup_root):
         raise UpdateError(f'Unsafe bind/backup overlap: {resolved}')
     if writable:
-        if not allowed_roots:
+        roots = normalize_allowed_roots(allowed_roots)
+        if not roots:
             raise UpdateError('RW bind mount requires global.allowed_bind_roots allowlist')
-        if not any(under(resolved, root) and resolved != root for root in allowed_roots):
+        if not any(under(resolved, root) and resolved != root for root in roots):
             raise UpdateError(f'RW bind source is outside allowed_bind_roots: {resolved}')
         if os.path.ismount(resolved):
             raise UpdateError(f'RW bind source is a mount point: {resolved}')
@@ -403,7 +416,7 @@ def inspect_stack(svc, config, backup_root=None, allowed_roots=()):
     named = set()
     binds = {}
     backup_root = backup_root or Path('/var/backups/svc-update').resolve()
-    allowed_roots = [Path(root).resolve(strict=True) for root in allowed_roots]
+    allowed_roots = normalize_allowed_roots(allowed_roots)
     target_mounts = services[target].get('volumes', [])
     for mount in target_mounts:
         if not isinstance(mount, dict):
